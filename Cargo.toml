@@ -4,8 +4,5 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-malachite = { git = "https://github.com/twizmwazin/malachite.git", branch = "dep/pyo3-0.24.0", features = [
-    "enable_pyo3",
-] }
 pyo3 = { version = "0.24.1", features = ["extension-module", "num-bigint"] }
 lazy_static = "1.4.0"

@@ -1,25 +1,49 @@
 use std::cmp::Ordering;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
-use num_bigint::BigUint;
-use num_traits::Zero;
+use lazy_static::lazy_static;
+use malachite::base::num::basic::traits::Zero;
+use malachite::natural::Natural;
 use pyo3::prelude::*;
+
+// String interning for sort field
+lazy_static! {
+    static ref STRING_INTERNER: Mutex<HashMap<String, Arc<String>>> = Mutex::new(HashMap::new());
+}
+
+// Helper function to intern strings
+fn intern_string(s: String) -> Arc<String> {
+    let mut interner = STRING_INTERNER.lock().unwrap();
+    if let Some(interned) = interner.get(&s) {
+        interned.clone()
+    } else {
+        let arc = Arc::new(s.clone());
+        interner.insert(s, arc.clone());
+        arc
+    }
+}
 
 #[pyclass]
 #[derive(Clone)]
 pub struct Segment {
     #[pyo3(get, set)]
-    pub start: BigUint,
+    pub start: Natural,
     #[pyo3(get, set)]
-    pub end: BigUint,
-    #[pyo3(get, set)]
-    pub sort: String,
+    pub end: Natural,
+    // Internal field uses Arc<String> for efficient comparison
+    sort: Arc<String>,
 }
 
 #[pymethods]
 impl Segment {
     #[new]
-    pub fn new(start: BigUint, end: BigUint, sort: String) -> Self {
-        Segment { start, end, sort }
+    pub fn new(start: Natural, end: Natural, sort: String) -> Self {
+        Segment {
+            start,
+            end,
+            sort: intern_string(sort),
+        }
     }
 
     pub fn copy(&self) -> Self {
@@ -27,8 +51,20 @@ impl Segment {
     }
 
     #[getter]
-    pub fn size(&self) -> BigUint {
+    pub fn size(&self) -> Natural {
         &self.end - &self.start
+    }
+
+    // Getter for sort to maintain Python interface
+    #[getter]
+    pub fn sort(&self) -> String {
+        self.sort.to_string()
+    }
+
+    // Setter for sort to maintain Python interface
+    #[setter]
+    pub fn set_sort(&mut self, value: String) {
+        self.sort = intern_string(value);
     }
 
     fn __repr__(&self) -> String {
@@ -40,13 +76,19 @@ impl Segment {
 #[pyclass]
 pub struct SegmentList {
     list: Vec<Segment>,
-    bytes_occupied: BigUint,
+    bytes_occupied: Natural,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Direction {
+    Forward,
+    Backward,
 }
 
 impl SegmentList {
     // Private helper methods for segment management
 
-    fn insert_and_merge(&mut self, address: BigUint, size: BigUint, sort: String, idx: usize) {
+    fn insert_and_merge(&mut self, address: Natural, size: Natural, sort: String, idx: usize) {
         // Sanity check
         if idx > 0 && &address + &size <= self.list[idx - 1].start {
             // There is a bug, since list[idx] must be the closest one that is less than the current segment
@@ -59,69 +101,60 @@ impl SegmentList {
         // The new block might be overlapping with other blocks. insert_and_merge_core will fix the overlapping.
         let end = &address + &size;
         if idx == self.list.len() {
-            self.list.push(Segment {
-                start: address,
-                end,
-                sort,
-            });
+            self.list.push(Segment::new(address, end, sort));
         } else {
-            self.list.insert(
-                idx,
-                Segment {
-                    start: address,
-                    end,
-                    sort,
-                },
-            );
+            self.list.insert(idx, Segment::new(address, end, sort));
         }
         // Apparently bytes_occupied will be wrong if the new block overlaps with any existing block.
         // We will fix it later
-        self.bytes_occupied += size.clone();
+        self.bytes_occupied += &size; // Use reference instead of clone
 
         // Search forward to merge blocks if necessary
         let mut pos = idx;
         while pos < self.list.len() {
-            let (merged, new_pos, bytes_change) = self.insert_and_merge_core(pos, "forward");
+            let (merged, new_pos, bytes_change) = self.insert_and_merge_core(pos, Direction::Forward);
             if !merged {
                 break;
             }
             pos = new_pos;
-            if !bytes_change.is_zero() {
-                self.bytes_occupied += bytes_change;
+            if bytes_change != Natural::ZERO {
+                self.bytes_occupied += &bytes_change;
             }
         }
 
         // Search backward to merge blocks if necessary
         let mut pos = idx;
         while pos > 0 {
-            let (merged, new_pos, bytes_change) = self.insert_and_merge_core(pos, "backward");
+            let (merged, new_pos, bytes_change) = self.insert_and_merge_core(pos, Direction::Backward);
             if !merged {
                 break;
             }
             pos = new_pos;
-            if !bytes_change.is_zero() {
-                self.bytes_occupied += bytes_change;
+            if bytes_change != Natural::ZERO {
+                self.bytes_occupied += &bytes_change;
             }
         }
     }
 
-    fn insert_and_merge_core(&mut self, pos: usize, direction: &str) -> (bool, usize, BigUint) {
-        let mut bytes_changed = BigUint::zero();
+    fn insert_and_merge_core(&mut self, pos: usize, direction: Direction) -> (bool, usize, Natural) {
+        let mut bytes_changed = Natural::ZERO;
         let mut merged = false;
         let mut new_pos = pos;
 
         // Determine previous_segment and segment based on direction
-        let (previous_segment_pos, segment_pos) = if direction == "forward" {
-            if pos == self.list.len() - 1 {
-                return (false, pos, BigUint::zero());
+        let (previous_segment_pos, segment_pos) = match direction {
+            Direction::Forward => {
+                if pos == self.list.len() - 1 {
+                    return (false, pos, Natural::ZERO);
+                }
+                (pos, pos + 1)
             }
-            (pos, pos + 1)
-        } else {
-            // direction == "backward"
-            if pos == 0 {
-                return (false, pos, BigUint::zero());
+            Direction::Backward => {
+                if pos == 0 {
+                    return (false, pos, Natural::ZERO);
+                }
+                (pos - 1, pos)
             }
-            (pos - 1, pos)
         };
 
         // Get references to the segments
@@ -170,7 +203,7 @@ impl SegmentList {
                         // We'll do this directly
                         self.bytes_occupied -= &old_size - &new_size;
                         // Return zero for bytes_changed since we've already updated bytes_occupied
-                        bytes_changed = BigUint::zero();
+                        bytes_changed = Natural::from(0u8);
                     }
                     Ordering::Equal => {}
                 }
@@ -184,7 +217,7 @@ impl SegmentList {
                 } else {
                     // They are overlapping. We will create one, two, or three different blocks based on how they are
                     // overlapping
-                    let mut new_segments = Vec::new();
+                    let mut new_segments = Vec::with_capacity(3);
 
                     if segment.start < previous_segment.start {
                         new_segments.push(Segment {
@@ -193,10 +226,9 @@ impl SegmentList {
                             sort: segment.sort.clone(),
                         });
 
-                        let sort = if direction == "forward" {
-                            previous_segment.sort.clone()
-                        } else {
-                            segment.sort.clone()
+                        let sort = match direction {
+                            Direction::Forward => previous_segment.sort.clone(),
+                            Direction::Backward => segment.sort.clone(),
                         };
 
                         new_segments.push(Segment {
@@ -232,10 +264,9 @@ impl SegmentList {
                             });
                         }
 
-                        let sort = if direction == "forward" {
-                            previous_segment.sort.clone()
-                        } else {
-                            segment.sort.clone()
+                        let sort = match direction {
+                            Direction::Forward => previous_segment.sort.clone(),
+                            Direction::Backward => segment.sort.clone(),
                         };
 
                         match segment.end.cmp(&previous_segment.end) {
@@ -295,12 +326,12 @@ impl SegmentList {
                     }
 
                     // Calculate old_size and new_size
-                    let mut old_size = BigUint::zero();
+                    let mut old_size = Natural::ZERO;
                     for i in previous_segment_pos..=segment_pos {
                         old_size += &self.list[i].end - &self.list[i].start;
                     }
 
-                    let mut new_size = BigUint::zero();
+                    let mut new_size = Natural::ZERO;
                     for seg in &new_segments {
                         new_size += &seg.end - &seg.start;
                     }
@@ -315,7 +346,7 @@ impl SegmentList {
                             // We'll do this directly
                             self.bytes_occupied -= &old_size - &new_size;
                             // Return zero for bytes_changed since we've already updated bytes_occupied
-                            bytes_changed = BigUint::zero();
+                            bytes_changed = Natural::ZERO;
                         }
                         Ordering::Equal => {}
                     }
@@ -346,7 +377,7 @@ impl SegmentList {
 
                     merged = true;
 
-                    if direction == "forward" {
+                    if direction == Direction::Forward {
                         new_pos = previous_segment_pos + new_segments.len() - 1;
                     } else {
                         new_pos = previous_segment_pos;
@@ -358,7 +389,7 @@ impl SegmentList {
         (merged, new_pos, bytes_changed)
     }
 
-    fn remove(&mut self, init_address: BigUint, init_size: BigUint, init_idx: usize) {
+    fn remove(&mut self, init_address: Natural, init_size: Natural, init_idx: usize) {
         let mut address = init_address;
         let mut size = init_size;
         let mut idx = init_idx;
@@ -377,7 +408,7 @@ impl SegmentList {
                         let new_size = &self.list[idx].end - &self.list[idx].start;
                         self.bytes_occupied -= old_size - new_size;
 
-                        if (&self.list[idx].end - &self.list[idx].start).is_zero() {
+                        if (&self.list[idx].end - &self.list[idx].start) == Natural::ZERO {
                             // remove the segment
                             self.list.remove(idx);
                         }
@@ -419,11 +450,11 @@ impl SegmentList {
                         self.list.remove(idx);
 
                         // Insert new segments if they have size > 0
-                        if !(&seg1.end - &seg1.start).is_zero() {
+                        if (&seg1.end - &seg1.start) != Natural::ZERO {
                             self.list.insert(idx, seg1);
                         }
 
-                        if !(&seg0.end - &seg0.start).is_zero() {
+                        if (&seg0.end - &seg0.start) != Natural::ZERO {
                             self.list.insert(idx, seg0);
                         }
 
@@ -453,7 +484,7 @@ impl SegmentList {
                                 let new_size = &self.list[idx].end - &self.list[idx].start;
                                 self.bytes_occupied -= old_size - new_size;
 
-                                if (&self.list[idx].end - &self.list[idx].start).is_zero() {
+                                if (&self.list[idx].end - &self.list[idx].start) == Natural::ZERO {
                                     // remove the segment
                                     self.list.remove(idx);
                                 }
@@ -499,7 +530,8 @@ impl SegmentList {
     }
 
     #[getter]
-    pub fn occupied_size(&self) -> BigUint {
+    pub fn occupied_size(&self) -> Natural {
+        // Clone only at the boundary
         self.bytes_occupied.clone()
     }
 
@@ -508,8 +540,8 @@ impl SegmentList {
         !self.list.is_empty()
     }
 
-    pub fn search(&self, addr: BigUint) -> usize {
-        // Match Python implementation behavior
+    pub fn search(&self, addr: Natural) -> usize {
+        // Match Python implementation behavior but with more efficient comparison
         let mut off = self
             .list
             .binary_search_by(|seg| {
@@ -522,14 +554,14 @@ impl SegmentList {
             .unwrap_or_else(|x| x);
 
         // Check if we need to adjust the offset
-        if 0 < off && off <= self.list.len() && self.list[off - 1].end > addr {
+        if off > 0 && off <= self.list.len() && self.list[off - 1].end > addr {
             off -= 1;
         }
 
         off
     }
 
-    pub fn next_free_pos(&self, address: BigUint) -> BigUint {
+    pub fn next_free_pos(&self, address: Natural) -> Natural {
         // Match Python implementation behavior
         let idx = self.search(address.clone());
 
@@ -555,10 +587,10 @@ impl SegmentList {
     #[pyo3(signature = (address, sorts, max_distance = None))]
     pub fn next_pos_with_sort_not_in(
         &self,
-        address: BigUint,
+        address: Natural,
         sorts: Vec<String>,
-        max_distance: Option<BigUint>,
-    ) -> Option<BigUint> {
+        max_distance: Option<Natural>,
+    ) -> Option<Natural> {
         // Match Python implementation behavior
         let list_length = self.list.len();
         let idx = self.search(address.clone());
@@ -628,7 +660,7 @@ impl SegmentList {
         None
     }
 
-    pub fn is_occupied(&self, address: BigUint) -> bool {
+    pub fn is_occupied(&self, address: Natural) -> bool {
         // Match Python implementation behavior
         let idx = self.search(address.clone());
 
@@ -645,7 +677,7 @@ impl SegmentList {
         false
     }
 
-    pub fn occupied_by(&self, address: BigUint) -> Option<(BigUint, BigUint, String)> {
+    pub fn occupied_by(&self, address: Natural) -> Option<(Natural, Natural, String)> {
         // Match Python implementation behavior
         let idx = self.search(address.clone());
 
@@ -655,7 +687,7 @@ impl SegmentList {
             return Some((
                 block.start.clone(),
                 (&block.end - &block.start),
-                block.sort.clone(),
+                block.sort.to_string(),
             ));
         }
 
@@ -665,26 +697,22 @@ impl SegmentList {
             return Some((
                 block.start.clone(),
                 (&block.end - &block.start),
-                block.sort.clone(),
+                block.sort.to_string(),
             ));
         }
 
         None
     }
 
-    pub fn occupy(&mut self, address: BigUint, size: BigUint, sort: String) {
-        if size.is_zero() {
+    pub fn occupy(&mut self, address: Natural, size: Natural, sort: String) {
+        if size == Natural::ZERO {
             return;
         }
 
         if self.list.is_empty() {
             let end = &address + &size;
-            self.list.push(Segment {
-                start: address,
-                end,
-                sort,
-            });
-            self.bytes_occupied += size;
+            self.list.push(Segment::new(address, end, sort));
+            self.bytes_occupied += &size; // Use reference instead of clone
             return;
         }
 
@@ -695,8 +723,8 @@ impl SegmentList {
         self.insert_and_merge(address, size, sort, idx);
     }
 
-    pub fn release(&mut self, address: BigUint, size: BigUint) {
-        if size.is_zero() {
+    pub fn release(&mut self, address: Natural, size: Natural) {
+        if size == Natural::ZERO {
             return;
         }
 
